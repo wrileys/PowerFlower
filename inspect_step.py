@@ -30,9 +30,6 @@ def _collect_steps_anywhere(node: Any) -> List[Dict]:
 
 
 def load_steps(data: Any) -> List[Dict]:
-    """
-    Collect ALL step objects from anywhere in the JSON tree, then dedupe by ID.
-    """
     all_steps = _collect_steps_anywhere(data)
 
     by_id: Dict[str, Dict] = {}
@@ -76,10 +73,6 @@ def find_step(steps: List[Dict], step_id: str) -> Dict:
 
 
 def get_trigger_event_type(trigger: Dict) -> str:
-    """
-    Try a few common fields to classify the trigger's event.
-    First look at trigger['event']['type'], then fall back to flat fields.
-    """
     ev = trigger.get("event")
     if isinstance(ev, dict):
         t = ev.get("type")
@@ -288,9 +281,6 @@ def get_widget_name(widget: Dict) -> str:
 
 
 def get_button_text(widget: Dict) -> str:
-    """
-    Try a few common places where button text might live.
-    """
     if widget.get("text"):
         return widget["text"]
     if widget.get("label"):
@@ -331,7 +321,6 @@ def get_widget_trigger_ids(widget: Dict[str, Any]) -> List[str]:
         if isinstance(val, list):
             ids.extend([t for t in val if isinstance(t, str)])
 
-    # Nested inside props/config/etc
     for container_key in ("props", "properties", "config", "options"):
         container = widget.get(container_key)
         if isinstance(container, dict):
@@ -392,11 +381,6 @@ def print_widget_groups(grouped: Dict[str, List[Dict]], trig_index: Dict[str, Di
 # ---------- Helpers for mermaid trigger expansion ----------
 
 def load_table_queries(data: Any) -> List[Dict]:
-    """
-    Try to find table-aggregation query objects anywhere in the JSON.
-    Prefer a top-level 'table_queries' (or similar) list, but fall back
-    to a recursive scan for objects that look like queries.
-    """
     tqs: List[Dict] = []
 
     # Direct top-level keys first
@@ -619,22 +603,16 @@ def sanitize_label(text: str) -> str:
       - strip quotes, backslashes, and curly/square braces
       - collapse whitespace
       - truncate very long labels
-
-    NOTE: we also strip the literal substring 'dms' so that "dms:Shift"
-    turns into ":Shift" for a nicer data-model-slot notation.
     """
     if text is None:
         return ""
     text = str(text)
 
-    # Remove characters that tend to break Mermaid parsing
-    for ch in ['"', '\\', '{', '}', '[', ']','dms']:
+    for ch in ['"', '\\', '{', '}', '[', ']','dms:']:
         text = text.replace(ch, '')
 
-    # Replace all whitespace runs (including newlines) with a single space
     text = " ".join(text.split())
 
-    # Keep labels readable
     if len(text) > 120:
         text = text[:117] + "..."
 
@@ -642,11 +620,6 @@ def sanitize_label(text: str) -> str:
 
 
 def format_dm_action_label(atype: str, ivs: List[Dict[str, Any]], ctx: Dict[str, Any]) -> str:
-    """
-    Render load/unload/create-or-load data model actions in Tulip-ish language.
-    Example:
-      Load record :Shift from agg:ShiftID Day
-    """
     slot_name = None
     source_desc = None
 
@@ -681,11 +654,6 @@ def format_dm_action_label(atype: str, ivs: List[Dict[str, Any]], ctx: Dict[str,
 def emit_combined_mermaid(graph: Graph,
                           logic_triggers: Dict[str, Dict[str, Any]],
                           ctx: Dict[str, Any]) -> str:
-    """
-    Emit a single Mermaid flowchart that includes:
-      - Step / widget / trigger graph for this step
-      - For each trigger on this step, a nested subgraph showing its IF/THEN clauses
-    """
     lines: List[str] = []
     lines.append("flowchart LR")
 
@@ -809,19 +777,41 @@ def emit_combined_mermaid(graph: Graph,
 
         lines.append("  end")
 
-        # Connect the trigger node to its logic subgraph entry
         if base in graph.nodes:
             lines.append(f"  {base} --> {base}_start")
 
     return "\n".join(lines)
 
 
-def main():
-    if len(sys.argv) < 2 or len(sys.argv) > 3:
-        print("Usage: python inspect_step.py app.json [step_id]")
-        sys.exit(1)
+# ---------- Main CLI ----------
 
-    json_file = sys.argv[1]
+def main():
+    DEFAULT_JSON = "app.json"
+
+    # Supported call patterns:
+    #   python inspect_step.py
+    #   python inspect_step.py app.json
+    #   python inspect_step.py app.json STEP_ID
+    argc = len(sys.argv)
+
+    if argc == 1:
+        # No args: use default JSON, no step id -> interactive picker
+        json_file = DEFAULT_JSON
+        step_id_arg = None
+    elif argc == 2:
+        # One arg: JSON filename, no step id -> interactive picker
+        json_file = sys.argv[1]
+        step_id_arg = None
+    elif argc == 3:
+        # Two args: JSON + explicit step id
+        json_file = sys.argv[1]
+        step_id_arg = sys.argv[2].strip()
+    else:
+        print("Usage:")
+        print("  python inspect_step.py")
+        print("  python inspect_step.py app.json")
+        print("  python inspect_step.py app.json STEP_ID")
+        sys.exit(1)
 
     # 1) Load JSON once
     with open(json_file, "r", encoding="utf-8") as f:
@@ -850,14 +840,12 @@ def main():
         "dms_index": dms_index,
     }
 
-    print(f"Loaded {len(steps)} step(s).")
+    print(f"Loaded {len(steps)} step(s) from {json_file}.")
 
-    # ---------- Step selection ----------
-    step: Dict[str, Any] = None
-    step_id: str = None
+    selected_steps: List[Dict[str, Any]] = []
 
-    if len(sys.argv) == 2:
-        # Interactive mode: list steps, ask for a number
+    if step_id_arg is None:
+        # Interactive mode: list steps, allow number or 'all'
         print("\nAvailable steps:\n")
         sorted_steps = sorted(
             steps,
@@ -880,30 +868,39 @@ def main():
             extra_str = f" ({', '.join(extras)})" if extras else ""
             print(f"{idx:3d}. {name}  [id={sid}]{extra_str}")
 
-        choice = input("\nEnter step number to inspect (or press Enter to quit): ").strip()
-        if not choice:
+        choice_raw = input(
+            "\nEnter step number to inspect, 'all' for all steps, "
+            "or press Enter to quit: "
+        ).strip()
+
+        if not choice_raw:
             print("No selection made; exiting.")
             sys.exit(0)
 
-        try:
-            n = int(choice)
-        except ValueError:
-            print(f"'{choice}' is not a valid integer index.")
-            sys.exit(1)
+        choice = choice_raw.lower()
+        if choice == "all":
+            selected_steps = sorted_steps
+            print(f"\nSelected ALL steps ({len(selected_steps)})")
+        else:
+            try:
+                n = int(choice_raw)
+            except ValueError:
+                print(f"'{choice_raw}' is not a valid integer index or 'all'.")
+                sys.exit(1)
 
-        if n < 1 or n > len(sorted_steps):
-            print(f"Step number {n} is out of range (1-{len(sorted_steps)}).")
-            sys.exit(1)
+            if n < 1 or n > len(sorted_steps):
+                print(f"Step number {n} is out of range (1–{len(sorted_steps)}).")
+                sys.exit(1)
 
-        step = sorted_steps[n - 1]
-        step_id = step.get("_id") or step.get("id") or ""
-        print(f"\nSelected step #{n}: {step.get('name') or '(no name)'} [id={step_id}]")
+            step = sorted_steps[n - 1]
+            selected_steps = [step]
+            step_id = step.get("_id") or step.get("id") or ""
+            print(f"\nSelected step #{n}: {step.get('name') or '(no name)'} [id={step_id}]")
 
     else:
-        step_id = sys.argv[2].strip()
-        step = find_step(steps, step_id)
+        step = find_step(steps, step_id_arg)
         if not step:
-            print(f"Step with ID '{step_id}' not found in loaded steps.")
+            print(f"Step with ID '{step_id_arg}' not found in loaded steps.")
 
             sample_ids = [s.get("_id") or s.get("id") for s in steps[:10]]
             print("Here are some step IDs I *did* find (first up to 10):")
@@ -911,7 +908,7 @@ def main():
                 print("  -", sid)
 
             print("\nDoing a quick substring search over step objects...")
-            needle = step_id
+            needle = step_id_arg
             hits = []
             for s in steps:
                 if needle in json.dumps(s):
@@ -925,65 +922,71 @@ def main():
 
             sys.exit(1)
 
+        selected_steps = [step]
 
-    print("================ Step summary ================")
-    print(f"Step ID: {step.get('_id')}")
-    print(f"Name: {step.get('name')}")
-    print(f"Parent process: {step.get('parent_process')}")
-    print(f"Parent step group: {step.get('parent_step_group')}")
-    print(f"Takt time: {step.get('takt_time')}")
+    # ---------- Process each selected step ----------
+    total = len(selected_steps)
 
-    step_trigger_ids = step.get("triggers", []) or []
-    step_widget_ids  = step.get("widgets", []) or []
+    for idx, step in enumerate(selected_steps, start=1):
+        step_id = step.get("_id") or step.get("id") or ""
+        name    = step.get("name") or "(no name)"
 
-    print(f"\nDirect trigger IDs ({len(step_trigger_ids)}): {step_trigger_ids}")
-    print(f"Widget IDs ({len(step_widget_ids)}): {step_widget_ids}")
+        print("\n" + "=" * 70)
+        print(f"### Step {idx}/{total}: {name} [id={step_id}]")
+        print("================ Step summary ================")
+        print(f"Step ID: {step.get('_id')}")
+        print(f"Name: {step.get('name')}")
+        print(f"Parent process: {step.get('parent_process')}")
+        print(f"Parent step group: {step.get('parent_step_group')}")
+        print(f"Takt time: {step.get('takt_time')}")
 
-    # 5) Collect and categorize triggers (text view)
-    step_trigger_objs = [trig_index.get(tid) for tid in step_trigger_ids]
-    cats = categorize_step_triggers(step_trigger_objs)
+        step_trigger_ids = step.get("triggers", []) or []
+        step_widget_ids  = step.get("widgets", []) or []
 
-    print("\n================ Step triggers (grouped) ================")
-    print_trigger_category("On step enter",        cats["step_open"])
-    print_trigger_category("Timers",               cats["interval"])
-    print_trigger_category("Machines & devices",   cats["machines_output"])
-    print_trigger_category("On step exit",         cats["step_closed"])
-    print_trigger_category("Other",                cats["other"])
+        print(f"\nDirect trigger IDs ({len(step_trigger_ids)}): {step_trigger_ids}")
+        print(f"Widget IDs ({len(step_widget_ids)}): {step_widget_ids}")
 
-    # 6) Group widgets by type (only those with triggers)
-    step_widget_objs = [widget_index.get(wid) for wid in step_widget_ids]
-    step_widget_objs = [
-        w for w in step_widget_objs
-        if w is not None and get_widget_trigger_ids(w)
-    ]
-    grouped_widgets = group_widgets_by_type(step_widget_objs)
-    print_widget_groups(grouped_widgets, trig_index)
+        step_trigger_objs = [trig_index.get(tid) for tid in step_trigger_ids]
+        cats = categorize_step_triggers(step_trigger_objs)
 
-    # 7) Collect triggers that appear on this step (direct + widget-attached)
-    logic_triggers: Dict[str, Dict[str, Any]] = {}
+        print("\n================ Step triggers (grouped) ================")
+        print_trigger_category("On step enter",        cats["step_open"])
+        print_trigger_category("Timers",               cats["interval"])
+        print_trigger_category("Machines & devices",   cats["machines_output"])
+        print_trigger_category("On step exit",         cats["step_closed"])
+        print_trigger_category("Other",                cats["other"])
 
-    # Direct step triggers
-    for trig in step_trigger_objs:
-        if not trig:
-            continue
-        tid = trig.get("_id") or trig.get("id")
-        if tid:
-            logic_triggers[tid] = trig
+        # Widgets with triggers
+        step_widget_objs = [widget_index.get(wid) for wid in step_widget_ids]
+        step_widget_objs = [
+            w for w in step_widget_objs
+            if w is not None and get_widget_trigger_ids(w)
+        ]
+        grouped_widgets = group_widgets_by_type(step_widget_objs)
+        print_widget_groups(grouped_widgets, trig_index)
 
-    # Widget-attached triggers
-    for w in step_widget_objs:
-        for tid in get_widget_trigger_ids(w):
-            t = trig_index.get(tid)
-            if t:
-                logic_triggers[tid] = t
+        # Collect triggers used on this step (direct + widget-attached)
+        logic_triggers: Dict[str, Dict[str, Any]] = {}
 
-    # 8) Build step graph + output combined Mermaid
-    print("\n================ Mermaid (step + trigger logic) ================")
-    if not logic_triggers and not step_trigger_ids and not step_widget_ids:
-        print("  (no triggers or widgets on this step)")
-    else:
-        g = build_graph_for_step(step, trig_index, widget_index, steps_index)
-        print(emit_combined_mermaid(g, logic_triggers, resource_ctx))
+        for trig in step_trigger_objs:
+            if not trig:
+                continue
+            tid = trig.get("_id") or trig.get("id")
+            if tid:
+                logic_triggers[tid] = trig
+
+        for w in step_widget_objs:
+            for tid in get_widget_trigger_ids(w):
+                t = trig_index.get(tid)
+                if t:
+                    logic_triggers[tid] = t
+
+        print("\n================ Mermaid (step + trigger logic) ================")
+        if not logic_triggers and not step_trigger_ids and not step_widget_ids:
+            print("  (no triggers or widgets on this step)")
+        else:
+            g = build_graph_for_step(step, trig_index, widget_index, steps_index)
+            print(emit_combined_mermaid(g, logic_triggers, resource_ctx))
 
 
 if __name__ == "__main__":
